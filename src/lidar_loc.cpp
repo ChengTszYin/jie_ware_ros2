@@ -1,5 +1,6 @@
 #include "rclcpp/rclcpp.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -28,10 +29,14 @@ public:
     lidar_x_(250.0f),
     lidar_y_(250.0f),
     lidar_yaw_(0.0f),
+    filtered_x_(250.0f),
+    filtered_y_(250.0f),
+    filtered_yaw_(0.0f),
     clear_countdown_(-1),
-    scan_count_(0)
+    scan_count_(0),
+    last_odom_time_(0, 0, RCL_ROS_TIME)
   {
-    this->declare_parameter<std::string>("base_frame", "base_footprint");
+    this->declare_parameter<std::string>("base_frame", "base_link");
     this->declare_parameter<std::string>("odom_frame", "odom");
     this->declare_parameter<std::string>("laser_frame", "laser");
     this->declare_parameter<std::string>("laser_topic", "scan");
@@ -54,6 +59,10 @@ public:
       laser_topic_, 10,
       std::bind(&LidarLoc::scanCallback, this, std::placeholders::_1));
 
+    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      "/odom", 30,
+      std::bind(&LidarLoc::odomCallback, this, std::placeholders::_1));
+
     initial_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       "/initialpose", 10,
       std::bind(&LidarLoc::initialPoseCallback, this, std::placeholders::_1));
@@ -62,17 +71,24 @@ public:
       "/global_costmap/clear_entirely_global_costmap");
 
     timer_ = this->create_wall_timer(
-      std::chrono::milliseconds(33),
+      std::chrono::milliseconds(30),
       std::bind(&LidarLoc::poseTf, this));
 
-    RCLCPP_INFO(this->get_logger(), "lidar_loc started");
+    RCLCPP_INFO(this->get_logger(), "lidar_loc started (always matching + odom prediction)");
   }
 
 private:
+  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+  {
+    // Store latest odometry for prediction
+    last_odom_ = *msg;
+    last_odom_time_ = msg->header.stamp;
+  }
+
   void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
   {
-    if (map_msg_.info.resolution <= 0.0) {
-      RCLCPP_ERROR(this->get_logger(), "Map information is invalid or not received yet");
+    if (map_msg_.data.empty() || map_msg_.info.resolution <= 0.0 || map_cropped_.empty()) {
+      RCLCPP_WARN(this->get_logger(), "Map not ready yet, ignoring initial pose");
       return;
     }
 
@@ -90,9 +106,12 @@ private:
                                   map_msg_.info.resolution - map_roi_info_.y_offset);
     lidar_yaw_ = static_cast<float>(-yaw);
 
+    filtered_x_   = lidar_x_;
+    filtered_y_   = lidar_y_;
+    filtered_yaw_ = lidar_yaw_;
+
     clear_countdown_ = 30;
-    RCLCPP_INFO(this->get_logger(), "Initial pose received: (%.1f, %.1f) yaw=%.2f",
-                lidar_x_, lidar_y_, lidar_yaw_);
+    RCLCPP_INFO(this->get_logger(), "Initial pose received");
   }
 
   void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
@@ -105,6 +124,43 @@ private:
 
   void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
   {
+    if (map_msg_.info.resolution <= 0.0) return;
+
+    // ===== Odometry prediction (helps tracking while moving) =====
+    static nav_msgs::msg::Odometry prev_odom;
+    static bool has_prev_odom = false;
+
+    if (has_prev_odom) {
+      // Simple delta in odom frame
+      double dx = last_odom_.pose.pose.position.x - prev_odom.pose.pose.position.x;
+      double dy = last_odom_.pose.pose.position.y - prev_odom.pose.pose.position.y;
+
+      tf2::Quaternion q1, q2;
+      tf2::fromMsg(prev_odom.pose.pose.orientation, q1);
+      tf2::fromMsg(last_odom_.pose.pose.orientation, q2);
+
+      double roll, pitch, yaw1, yaw2;
+      tf2::Matrix3x3(q1).getRPY(roll, pitch, yaw1);
+      tf2::Matrix3x3(q2).getRPY(roll, pitch, yaw2);
+      double dyaw = yaw2 - yaw1;
+
+      // Convert odom delta into map pixels and apply
+      float res = map_msg_.info.resolution;
+      float cos_y = std::cos(-lidar_yaw_);
+      float sin_y = std::sin(-lidar_yaw_);
+
+      float dx_map = (cos_y * dx - sin_y * dy) / res;
+      float dy_map = (sin_y * dx + cos_y * dy) / res;
+
+      lidar_x_ += dx_map;
+      lidar_y_ -= dy_map;   // note the sign because of your coordinate convention
+      lidar_yaw_ -= static_cast<float>(dyaw);
+    }
+
+    prev_odom = last_odom_;
+    has_prev_odom = true;
+    // =============================================================
+
     scan_points_.clear();
     double angle = msg->angle_min;
 
@@ -160,11 +216,12 @@ private:
       ++scan_count_;
     }
 
-    // Matching loop
-    while (rclcpp::ok()) {
-      if (map_cropped_.empty() || map_temp_.empty()) {
-        break;
-      }
+    // Matching (always runs)
+    int max_iterations = 5;
+    int iter = 0;
+
+    while (rclcpp::ok() && iter < max_iterations) {
+      if (map_cropped_.empty() || map_temp_.empty()) break;
 
       std::vector<cv::Point2f> transform_points, clockwise_points, counter_points;
       int max_sum = 0;
@@ -186,7 +243,10 @@ private:
         counter_points.emplace_back(rx + lidar_x_, lidar_y_ - ry);
       }
 
-      std::vector<cv::Point2f> offsets = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+      std::vector<cv::Point2f> offsets = {
+        {0,0}, {1,0},{-1,0},{0,1},{0,-1},
+        {1,1},{1,-1},{-1,1},{-1,-1}
+      };
       std::vector<std::vector<cv::Point2f>> point_sets = {
         transform_points, clockwise_points, counter_points};
       std::vector<float> yaw_offsets = {0.0f, deg_to_rad_, -deg_to_rad_};
@@ -214,10 +274,15 @@ private:
       lidar_y_ += best_dy;
       lidar_yaw_ += best_dyaw;
 
-      if (check(lidar_x_, lidar_y_, lidar_yaw_)) {
-        break;
-      }
+      if (check(lidar_x_, lidar_y_, lidar_yaw_)) break;
+      ++iter;
     }
+
+    // Stronger filter to reduce shaking while still tracking
+    const float alpha = 0.38f;
+    filtered_x_   = alpha * lidar_x_   + (1.0f - alpha) * filtered_x_;
+    filtered_y_   = alpha * lidar_y_   + (1.0f - alpha) * filtered_y_;
+    filtered_yaw_ = alpha * lidar_yaw_ + (1.0f - alpha) * filtered_yaw_;
 
     if (clear_countdown_ > -1) {
       --clear_countdown_;
@@ -277,9 +342,13 @@ private:
     map_roi_info_.width = width;
     map_roi_info_.height = height;
 
-    geometry_msgs::msg::PoseWithCovarianceStamped init;
-    init.pose.pose.orientation.w = 1.0;
-    initialPoseCallback(std::make_shared<geometry_msgs::msg::PoseWithCovarianceStamped>(init));
+    lidar_x_ = static_cast<float>(width) / 2.0f;
+    lidar_y_ = static_cast<float>(height) / 2.0f;
+    lidar_yaw_ = 0.0f;
+
+    filtered_x_ = lidar_x_;
+    filtered_y_ = lidar_y_;
+    filtered_yaw_ = lidar_yaw_;
   }
 
   cv::Mat createGradientMask(int size)
@@ -360,11 +429,11 @@ private:
       return;
     }
 
-    double map_x = (lidar_x_ + map_roi_info_.x_offset) * map_msg_.info.resolution +
+    double map_x = (filtered_x_ + map_roi_info_.x_offset) * map_msg_.info.resolution +
                    map_msg_.info.origin.position.x;
-    double map_y = (lidar_y_ + map_roi_info_.y_offset) * map_msg_.info.resolution +
+    double map_y = (filtered_y_ + map_roi_info_.y_offset) * map_msg_.info.resolution +
                    map_msg_.info.origin.position.y;
-    double map_yaw = -lidar_yaw_;
+    double map_yaw = -filtered_yaw_;
 
     tf2::Transform map_to_base;
     map_to_base.setOrigin(tf2::Vector3(map_x, map_y, 0.0));
@@ -389,7 +458,7 @@ private:
     tf2::Transform map_to_odom = map_to_base * odom_to_base.inverse();
 
     geometry_msgs::msg::TransformStamped map_to_odom_msg;
-    map_to_odom_msg.header.stamp = this->now();
+    map_to_odom_msg.header.stamp = odom_to_base_msg.header.stamp;
     map_to_odom_msg.header.frame_id = "map";
     map_to_odom_msg.child_frame_id = odom_frame_;
     map_to_odom_msg.transform = tf2::toMsg(map_to_odom);
@@ -401,6 +470,9 @@ private:
   std::string base_frame_, odom_frame_, laser_frame_, laser_topic_;
 
   nav_msgs::msg::OccupancyGrid map_msg_;
+  nav_msgs::msg::Odometry last_odom_;
+  rclcpp::Time last_odom_time_;
+
   struct MapRoi {
     int x_offset = 0;
     int y_offset = 0;
@@ -412,7 +484,9 @@ private:
   std::vector<cv::Point2f> scan_points_;
 
   float lidar_x_, lidar_y_, lidar_yaw_;
+  float filtered_x_, filtered_y_, filtered_yaw_;
   const float deg_to_rad_ = static_cast<float>(M_PI / 180.0);
+
   int clear_countdown_;
   int scan_count_;
 
@@ -425,6 +499,7 @@ private:
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
   rclcpp::Client<std_srvs::srv::Empty>::SharedPtr clear_costmaps_client_;
   rclcpp::TimerBase::SharedPtr timer_;
